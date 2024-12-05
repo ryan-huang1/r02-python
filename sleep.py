@@ -4,17 +4,21 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from enum import IntEnum
-import sys
 import logging
-import re
-
 from bleak import BleakScanner, BleakClient
 from bleak.backends.device import BLEDevice
 from bleak.backends.characteristic import BleakGATTCharacteristic
 
 # Set up logging to help debug
-logging.basicConfig(level=logging.WARNING)  # Change to WARNING to suppress DEBUG and INFO messages
+logging.basicConfig(level=logging.WARNING)  # Change to DEBUG for more detailed logs
 logger = logging.getLogger(__name__)
+
+# Device name prefixes to identify R02 ring and compatible devices
+DEVICE_NAME_PREFIXES = [
+    "R01", "R02", "R03", "R04", "R05", "R06", "R07", "R10",  # Basic R-series
+    "VK-5098", "MERLIN", "Hello Ring", "RING1", "boAtring", "TR-R02", "SE",
+    "EVOLVEO", "GL-SR2", "Blaupunkt", "KSIX RING",
+]
 
 # Ring service UUIDs
 BIG_DATA_SERVICE = "DE5BF728-D711-4E47-AF26-65E3012A5DC7"
@@ -25,13 +29,6 @@ BIG_DATA_NOTIFY = "DE5BF729-D711-4E47-AF26-65E3012A5DC7"
 BIG_DATA_MAGIC = 0xBC
 SLEEP_DATA_ID = 0x27
 
-# Ring name patterns to match
-RING_PATTERNS = [
-    r"R02_[A-Z0-9]+",  # Matches patterns like R02_AC04
-    r"R06_[A-Z0-9]+",  # Matches R06 variants
-    r"R10_[A-Z0-9]+",  # Matches R10 variants
-]
-
 class SleepType(IntEnum):
     NODATA = 0x00
     LIGHT = 0x02
@@ -39,7 +36,6 @@ class SleepType(IntEnum):
     REM = 0x04
     AWAKE = 0x05
     UNKNOWN = -1
-    # You can add more sleep types if known
 
     def to_string(self) -> str:
         return {
@@ -105,19 +101,43 @@ class SleepDay:
             print(f"- {period.start_time.strftime('%I:%M %p')}: "
                   f"{period.type.to_string()} for {period.minutes} minutes")
 
-async def find_ring() -> BLEDevice | None:
-    """Scan for R02 ring or compatible devices"""
-    print("Scanning for R02 ring...")
+async def find_ring(scan_time: float = 10.0) -> BLEDevice | None:
+    """Scan for R02 ring or compatible devices."""
+    print(f"Scanning for devices for {scan_time} seconds...")
 
-    devices = await BleakScanner.discover()
-    for device in devices:
+    # Use a dictionary to store unique devices by address
+    discovered_devices_dict = {}
+
+    def callback(device: BLEDevice, advertisement_data):
         if device.name:
-            logger.debug(f"Found device: {device.name} ({device.address})")
-            # Check if device name matches any of our patterns
-            if any(re.match(pattern, device.name) for pattern in RING_PATTERNS):
-                logger.debug(f"Found matching ring: {device.name}")
-                return device
-    return None
+            # Only store the latest advertisement for each unique address
+            discovered_devices_dict[device.address] = device
+
+    scanner = BleakScanner(detection_callback=callback)
+    await scanner.start()
+    await asyncio.sleep(scan_time)
+    await scanner.stop()
+
+    # Convert dictionary values back to list
+    devices = list(discovered_devices_dict.values())
+
+    if not devices:
+        print("\nNo devices found. Try moving the ring closer to your computer.")
+        return None
+
+    # Filter for compatible devices
+    compatible_devices = [
+        device for device in devices
+        if device.name and any(device.name.startswith(prefix) for prefix in DEVICE_NAME_PREFIXES)
+    ]
+
+    if not compatible_devices:
+        print("\nNo R02 devices found. Please ensure your ring is nearby and powered on.")
+        return None
+
+    selected_device = compatible_devices[0]
+    print(f"\nConnecting to {selected_device.name} ({selected_device.address})")
+    return selected_device
 
 def decode_timestamp_unix(data: bytes) -> datetime:
     """Decode timestamp as a 4-byte little-endian Unix timestamp"""
@@ -159,8 +179,8 @@ async def get_sleep_data(client: BleakClient) -> list[SleepDay]:
     packet = bytearray([
         BIG_DATA_MAGIC,     # Magic number
         SLEEP_DATA_ID,      # Sleep data ID
-        0, 0,              # Data length (0 for request)
-        0xFF, 0xFF         # CRC16 (0xFFFF for request)
+        0, 0,               # Data length (0 for request)
+        0xFF, 0xFF          # CRC16 (0xFFFF for request)
     ])
 
     all_records: list[tuple[SleepType, int, int]] = []  # (sleep_type, duration, offset)
@@ -254,8 +274,12 @@ async def get_sleep_data(client: BleakClient) -> list[SleepDay]:
 
         # Create sleep periods from the records
         if timestamp:
-            # Adjust the date to yesterday's date if sleep started in the evening
-            adjusted_date = datetime.now().date() - timedelta(days=1) if timestamp.hour > datetime.now().hour else datetime.now().date()
+            # Adjust the date if sleep started in the evening
+            now = datetime.now()
+            if timestamp.hour > now.hour:
+                adjusted_date = (now - timedelta(days=1)).date()
+            else:
+                adjusted_date = now.date()
             timestamp = timestamp.replace(year=adjusted_date.year, month=adjusted_date.month, day=adjusted_date.day)
             print(f"Adjusted timestamp: {timestamp.isoformat()}")
         else:
@@ -290,7 +314,6 @@ async def get_sleep_data(client: BleakClient) -> list[SleepDay]:
             await client.stop_notify(notify_char)
 
 async def main():
-    # Find the ring
     device = await find_ring()
     if not device:
         print("No R02 ring found nearby. Make sure it's charged and close to your computer.")
@@ -298,19 +321,15 @@ async def main():
 
     print(f"Found ring: {device.name} ({device.address})")
 
-    # Connect to the ring
     try:
-        async with BleakClient(device, timeout=20.0) as client:
+        async with BleakClient(device) as client:
             print("Connected to ring")
-
-            # Get sleep data
             sleep_data = await get_sleep_data(client)
 
             if not sleep_data:
                 print("No sleep data available")
                 return
 
-            # Print sleep data
             for day in sleep_data:
                 day.print_summary()
     except Exception as e:
@@ -321,4 +340,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\nOperation cancelled by user")
-        sys.exit(1)
