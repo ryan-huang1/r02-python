@@ -13,7 +13,7 @@ from bleak.backends.device import BLEDevice
 from bleak.backends.characteristic import BleakGATTCharacteristic
 
 # Set up logging to help debug
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.WARNING)  # Change to WARNING to suppress DEBUG and INFO messages
 logger = logging.getLogger(__name__)
 
 # Ring service UUIDs
