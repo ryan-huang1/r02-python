@@ -33,20 +33,23 @@ RING_PATTERNS = [
 ]
 
 class SleepType(IntEnum):
-    NODATA = 0
-    ERROR = 1
-    LIGHT = 2
-    DEEP = 3
-    AWAKE = 5
+    NODATA = 0x00
+    LIGHT = 0x02
+    DEEP = 0x03
+    REM = 0x04
+    AWAKE = 0x05
+    UNKNOWN = -1
+    # You can add more sleep types if known
 
     def to_string(self) -> str:
         return {
             SleepType.NODATA: "No Data",
-            SleepType.ERROR: "Error",
             SleepType.LIGHT: "Light Sleep",
             SleepType.DEEP: "Deep Sleep",
-            SleepType.AWAKE: "Awake"
-        }[self]
+            SleepType.REM: "REM Sleep",
+            SleepType.AWAKE: "Awake",
+            SleepType.UNKNOWN: "Unknown"
+        }.get(self, f"Unknown ({self.value})")
 
 @dataclass
 class SleepPeriod:
@@ -60,26 +63,43 @@ class SleepDay:
     sleep_start: datetime
     sleep_end: datetime
     periods: list[SleepPeriod]
-    
+
     @property
     def total_sleep_minutes(self) -> int:
-        return sum(p.minutes for p in self.periods if p.type in [SleepType.LIGHT, SleepType.DEEP])
-    
+        return sum(p.minutes for p in self.periods if p.type in [
+            SleepType.LIGHT, SleepType.DEEP, SleepType.REM])
+
     @property
     def deep_sleep_minutes(self) -> int:
         return sum(p.minutes for p in self.periods if p.type == SleepType.DEEP)
-    
+
     @property
     def light_sleep_minutes(self) -> int:
         return sum(p.minutes for p in self.periods if p.type == SleepType.LIGHT)
+
+    @property
+    def rem_sleep_minutes(self) -> int:
+        return sum(p.minutes for p in self.periods if p.type == SleepType.REM)
+
+    @property
+    def awake_minutes(self) -> int:
+        return sum(p.minutes for p in self.periods if p.type == SleepType.AWAKE)
+
+    @property
+    def unknown_minutes(self) -> int:
+        return sum(p.minutes for p in self.periods if p.type == SleepType.UNKNOWN)
 
     def print_summary(self):
         print(f"\nSleep Summary for {self.date.strftime('%Y-%m-%d')}")
         print(f"Sleep Start: {self.sleep_start.strftime('%I:%M %p')}")
         print(f"Sleep End: {self.sleep_end.strftime('%I:%M %p')}")
-        print(f"Total Sleep: {self.total_sleep_minutes // 60}h {self.total_sleep_minutes % 60}m")
+        total_minutes = (self.sleep_end - self.sleep_start).total_seconds() // 60
+        print(f"Total Sleep Time: {int(total_minutes // 60)}h {int(total_minutes % 60)}m")
         print(f"Deep Sleep: {self.deep_sleep_minutes // 60}h {self.deep_sleep_minutes % 60}m")
         print(f"Light Sleep: {self.light_sleep_minutes // 60}h {self.light_sleep_minutes % 60}m")
+        print(f"REM Sleep: {self.rem_sleep_minutes // 60}h {self.rem_sleep_minutes % 60}m")
+        print(f"Time Awake: {self.awake_minutes // 60}h {self.awake_minutes % 60}m")
+        print(f"Unknown Sleep: {self.unknown_minutes // 60}h {self.unknown_minutes % 60}m")
         print("\nSleep Phases:")
         for period in self.periods:
             print(f"- {period.start_time.strftime('%I:%M %p')}: "
@@ -88,7 +108,7 @@ class SleepDay:
 async def find_ring() -> BLEDevice | None:
     """Scan for R02 ring or compatible devices"""
     print("Scanning for R02 ring...")
-    
+
     devices = await BleakScanner.discover()
     for device in devices:
         if device.name:
@@ -99,72 +119,123 @@ async def find_ring() -> BLEDevice | None:
                 return device
     return None
 
-def parse_notification_data(data: bytearray) -> list[tuple[int, int]]:
-    """Parse a single notification packet into list of (type, minutes) pairs"""
-    periods = []
+def decode_timestamp_unix(data: bytes) -> datetime:
+    """Decode timestamp as a 4-byte little-endian Unix timestamp"""
+    try:
+        timestamp_int = int.from_bytes(data[:4], byteorder='little')
+        timestamp = datetime.utcfromtimestamp(timestamp_int)
+        print(f"Decoded timestamp: {timestamp.isoformat()}")
+        return timestamp
+    except Exception as e:
+        logger.error(f"Error decoding timestamp: {e}")
+        return datetime.now(timezone.utc)
+
+def parse_sleep_records(data: bytes, start_offset: int = 0) -> list[tuple[SleepType, int, int]]:
+    """Parse raw sleep record bytes into (type, duration, offset) tuples."""
+    records = []
     i = 0
+
+    print("\nParsing sleep records:")
     while i < len(data) - 1:
-        sleep_type = data[i]
-        minutes = data[i + 1]
-        if sleep_type in [2, 3, 5] and minutes > 0:  # Valid sleep types and duration
-            periods.append((sleep_type, minutes))
-        i += 2
-    return periods
+        raw_type = data[i]
+        duration = data[i + 1]
+
+        # Map raw type to SleepType
+        sleep_type = SleepType(raw_type) if raw_type in SleepType._value2member_map_ else SleepType.UNKNOWN
+
+        # Debug print all records
+        print(f"Offset {start_offset + i:02d}: "
+              f"Raw Type=0x{raw_type:02X}, Duration={duration} "
+              f"({sleep_type.to_string()})")
+
+        if duration > 0:
+            records.append((sleep_type, duration, start_offset + i))
+
+        i += 2  # Move to the next record (type + duration)
+    return records
 
 async def get_sleep_data(client: BleakClient) -> list[SleepDay]:
     """Request and parse sleep data from the ring"""
-    # Create Big Data request packet
     packet = bytearray([
         BIG_DATA_MAGIC,     # Magic number
         SLEEP_DATA_ID,      # Sleep data ID
         0, 0,              # Data length (0 for request)
         0xFF, 0xFF         # CRC16 (0xFFFF for request)
     ])
-    
-    # Set up notification handling
-    all_periods: list[tuple[int, int]] = []
+
+    all_records: list[tuple[SleepType, int, int]] = []  # (sleep_type, duration, offset)
     done_event = asyncio.Event()
-    
+    first_packet = None
+    timestamp = None
+    incomplete_record = None  # Store incomplete record between packets
+
     def notification_handler(sender: BleakGATTCharacteristic, data: bytearray):
-        nonlocal all_periods
-        logger.debug(f"Received notification: {data.hex()}")
-        
-        if data.startswith(bytes([BIG_DATA_MAGIC, SLEEP_DATA_ID])):
-            # First packet - extract payload after header
+        nonlocal all_records, first_packet, timestamp, incomplete_record
+        print(f"\nReceived packet ({len(data)} bytes): {data.hex()}")
+
+        # Handle first packet
+        if first_packet is None and data.startswith(bytes([BIG_DATA_MAGIC, SLEEP_DATA_ID])):
+            first_packet = data
+            # Extract metadata
             if 0x57 in data:  # Find data start marker
                 start_idx = data.index(0x57) + 1
-                periods = parse_notification_data(data[start_idx:])
-                all_periods.extend(periods)
+                print("Found data start marker at offset:", start_idx)
+
+                # Get timestamp bytes
+                if start_idx + 6 <= len(data):
+                    ts_bytes = data[start_idx:start_idx+6]
+                    timestamp = decode_timestamp_unix(ts_bytes)
+
+                    # Parse sleep records from remainder of first packet
+                    sleep_data = data[start_idx+6:]
+                    if incomplete_record:
+                        sleep_data = incomplete_record + sleep_data
+                        incomplete_record = None
+                    if len(sleep_data) % 2 != 0:
+                        incomplete_record = sleep_data[-1:]
+                        sleep_data = sleep_data[:-1]
+                    records = parse_sleep_records(sleep_data, start_offset=start_idx+6)
+                    all_records.extend(records)
+                else:
+                    incomplete_record = data[start_idx+6:]
         else:
-            # Subsequent packets - parse entire content
-            periods = parse_notification_data(data)
-            all_periods.extend(periods)
-            
+            # Append subsequent sleep data
+            sleep_data = data
+            if incomplete_record:
+                sleep_data = incomplete_record + data
+                incomplete_record = None
+            if len(sleep_data) % 2 != 0:
+                incomplete_record = sleep_data[-1:]
+                sleep_data = sleep_data[:-1]
+            records = parse_sleep_records(sleep_data)
+            all_records.extend(records)
+
             # Check if this might be the last packet
             if len(data) < 20:  # Last packet is typically shorter
                 done_event.set()
-    
+
     try:
         # Get the Big Data characteristic
+        await client.get_services()
         big_data_service = client.services.get_service(BIG_DATA_SERVICE)
         if not big_data_service:
             logger.error("Big Data service not found")
             return []
-            
+
         notify_char = big_data_service.get_characteristic(BIG_DATA_NOTIFY)
         write_char = big_data_service.get_characteristic(BIG_DATA_WRITE)
-        
+
         if not notify_char or not write_char:
             logger.error("Required characteristics not found")
             return []
-        
+
         # Enable notifications and send request
         logger.debug("Enabling notifications...")
         await client.start_notify(notify_char, notification_handler)
-        
+
         logger.debug(f"Sending request: {packet.hex()}")
         await client.write_gatt_char(write_char, packet)
-        
+
         # Wait for response data
         logger.debug("Waiting for response...")
         try:
@@ -172,36 +243,50 @@ async def get_sleep_data(client: BleakClient) -> list[SleepDay]:
         except asyncio.TimeoutError:
             logger.error("Timeout waiting for sleep data")
             return []
-            
-        # Process the collected periods into sleep days
-        if not all_periods:
+
+        # Process the collected records
+        if not all_records:
             return []
-            
-        # Convert periods into SleepDay objects
-        now = datetime.now(timezone.utc)
-        base_time = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        current_time = base_time
-        
+
+        print("\nCollected Records:")
+        for sleep_type, duration, offset in all_records:
+            print(f"Offset {offset:02d}: {sleep_type.to_string()}, {duration} minutes")
+
+        # Create sleep periods from the records
+        if timestamp:
+            # Adjust the date to yesterday's date if sleep started in the evening
+            adjusted_date = datetime.now().date() - timedelta(days=1) if timestamp.hour > datetime.now().hour else datetime.now().date()
+            timestamp = timestamp.replace(year=adjusted_date.year, month=adjusted_date.month, day=adjusted_date.day)
+            print(f"Adjusted timestamp: {timestamp.isoformat()}")
+        else:
+            timestamp = datetime.now(timezone.utc).replace(
+                hour=0, minute=0, second=0, microsecond=0)
+
+        start_time = timestamp
+        current_time = start_time
+
         periods = []
-        for sleep_type, minutes in all_periods:
+        for sleep_type, duration, _ in all_records:
             periods.append(SleepPeriod(
-                type=SleepType(sleep_type),
-                minutes=minutes,
+                type=sleep_type,
+                minutes=duration,
                 start_time=current_time
             ))
-            current_time += timedelta(minutes=minutes)
-        
+            current_time += timedelta(minutes=duration)
+
+        sleep_end = current_time
+
         if periods:
             return [SleepDay(
-                date=base_time,
+                date=start_time.date(),
                 sleep_start=periods[0].start_time,
-                sleep_end=periods[-1].start_time + timedelta(minutes=periods[-1].minutes),
+                sleep_end=sleep_end,
                 periods=periods
             )]
         return []
-        
+
     finally:
-        if notify_char:
+        if 'notify_char' in locals():
             await client.stop_notify(notify_char)
 
 async def main():
@@ -210,21 +295,21 @@ async def main():
     if not device:
         print("No R02 ring found nearby. Make sure it's charged and close to your computer.")
         return
-    
+
     print(f"Found ring: {device.name} ({device.address})")
-    
+
     # Connect to the ring
     try:
         async with BleakClient(device, timeout=20.0) as client:
             print("Connected to ring")
-            
+
             # Get sleep data
             sleep_data = await get_sleep_data(client)
-            
+
             if not sleep_data:
                 print("No sleep data available")
                 return
-            
+
             # Print sleep data
             for day in sleep_data:
                 day.print_summary()
