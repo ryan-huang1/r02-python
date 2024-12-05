@@ -16,12 +16,14 @@ from bleak.backends.characteristic import BleakGATTCharacteristic
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
-# Big Data protocol constants
+# Ring service UUIDs
 BIG_DATA_SERVICE = "DE5BF728-D711-4E47-AF26-65E3012A5DC7"
 BIG_DATA_WRITE = "DE5BF72A-D711-4E47-AF26-65E3012A5DC7"
 BIG_DATA_NOTIFY = "DE5BF729-D711-4E47-AF26-65E3012A5DC7"
-BIG_DATA_MAGIC = 188
-SLEEP_DATA_ID = 39
+
+# Command constants
+BIG_DATA_MAGIC = 0xBC
+SLEEP_DATA_ID = 0x27
 
 # Ring name patterns to match
 RING_PATTERNS = [
@@ -66,6 +68,10 @@ class SleepDay:
     @property
     def deep_sleep_minutes(self) -> int:
         return sum(p.minutes for p in self.periods if p.type == SleepType.DEEP)
+    
+    @property
+    def light_sleep_minutes(self) -> int:
+        return sum(p.minutes for p in self.periods if p.type == SleepType.LIGHT)
 
     def print_summary(self):
         print(f"\nSleep Summary for {self.date.strftime('%Y-%m-%d')}")
@@ -73,6 +79,7 @@ class SleepDay:
         print(f"Sleep End: {self.sleep_end.strftime('%I:%M %p')}")
         print(f"Total Sleep: {self.total_sleep_minutes // 60}h {self.total_sleep_minutes % 60}m")
         print(f"Deep Sleep: {self.deep_sleep_minutes // 60}h {self.deep_sleep_minutes % 60}m")
+        print(f"Light Sleep: {self.light_sleep_minutes // 60}h {self.light_sleep_minutes % 60}m")
         print("\nSleep Phases:")
         for period in self.periods:
             print(f"- {period.start_time.strftime('%I:%M %p')}: "
@@ -92,43 +99,58 @@ async def find_ring() -> BLEDevice | None:
                 return device
     return None
 
+def parse_notification_data(data: bytearray) -> list[tuple[int, int]]:
+    """Parse a single notification packet into list of (type, minutes) pairs"""
+    periods = []
+    i = 0
+    while i < len(data) - 1:
+        sleep_type = data[i]
+        minutes = data[i + 1]
+        if sleep_type in [2, 3, 5] and minutes > 0:  # Valid sleep types and duration
+            periods.append((sleep_type, minutes))
+        i += 2
+    return periods
+
 async def get_sleep_data(client: BleakClient) -> list[SleepDay]:
     """Request and parse sleep data from the ring"""
     # Create Big Data request packet
     packet = bytearray([
-        BIG_DATA_MAGIC,  # Magic number
-        SLEEP_DATA_ID,   # Sleep data ID
-        0, 0,           # Data length (0 for request)
-        0xFF, 0xFF      # CRC16 (0xFFFF for request)
+        BIG_DATA_MAGIC,     # Magic number
+        SLEEP_DATA_ID,      # Sleep data ID
+        0, 0,              # Data length (0 for request)
+        0xFF, 0xFF         # CRC16 (0xFFFF for request)
     ])
     
-    # Set up notification handler and response future
-    response_data = bytearray()
-    response_event = asyncio.Event()
+    # Set up notification handling
+    all_periods: list[tuple[int, int]] = []
+    done_event = asyncio.Event()
     
     def notification_handler(sender: BleakGATTCharacteristic, data: bytearray):
-        nonlocal response_data
+        nonlocal all_periods
         logger.debug(f"Received notification: {data.hex()}")
-        response_data.extend(data)
-        if len(response_data) >= 6:  # We have at least the header
-            data_len = (response_data[2] << 8) | response_data[3]
-            if len(response_data) >= data_len + 6:  # We have all the data
-                response_event.set()
+        
+        if data.startswith(bytes([BIG_DATA_MAGIC, SLEEP_DATA_ID])):
+            # First packet - extract payload after header
+            if 0x57 in data:  # Find data start marker
+                start_idx = data.index(0x57) + 1
+                periods = parse_notification_data(data[start_idx:])
+                all_periods.extend(periods)
+        else:
+            # Subsequent packets - parse entire content
+            periods = parse_notification_data(data)
+            all_periods.extend(periods)
+            
+            # Check if this might be the last packet
+            if len(data) < 20:  # Last packet is typically shorter
+                done_event.set()
     
     try:
-        # Get the services and characteristics
-        logger.debug("Getting services...")
-        services = client.services
-        for service in services:
-            logger.debug(f"Found service: {service.uuid}")
-            for char in service.characteristics:
-                logger.debug(f"  Characteristic: {char.uuid}")
-        
-        big_data_service = services.get_service(BIG_DATA_SERVICE)
+        # Get the Big Data characteristic
+        big_data_service = client.services.get_service(BIG_DATA_SERVICE)
         if not big_data_service:
             logger.error("Big Data service not found")
             return []
-        
+            
         notify_char = big_data_service.get_characteristic(BIG_DATA_NOTIFY)
         write_char = big_data_service.get_characteristic(BIG_DATA_WRITE)
         
@@ -136,90 +158,51 @@ async def get_sleep_data(client: BleakClient) -> list[SleepDay]:
             logger.error("Required characteristics not found")
             return []
         
-        # Enable notifications
+        # Enable notifications and send request
         logger.debug("Enabling notifications...")
         await client.start_notify(notify_char, notification_handler)
         
-        # Send request
         logger.debug(f"Sending request: {packet.hex()}")
         await client.write_gatt_char(write_char, packet)
         
-        # Wait for response with timeout
+        # Wait for response data
         logger.debug("Waiting for response...")
         try:
-            await asyncio.wait_for(response_event.wait(), timeout=10.0)
+            await asyncio.wait_for(done_event.wait(), timeout=10.0)
         except asyncio.TimeoutError:
             logger.error("Timeout waiting for sleep data")
             return []
+            
+        # Process the collected periods into sleep days
+        if not all_periods:
+            return []
+            
+        # Convert periods into SleepDay objects
+        now = datetime.now(timezone.utc)
+        base_time = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        current_time = base_time
         
-        # Parse response
-        logger.debug(f"Received complete response: {response_data.hex()}")
-        return parse_sleep_data(response_data)
+        periods = []
+        for sleep_type, minutes in all_periods:
+            periods.append(SleepPeriod(
+                type=SleepType(sleep_type),
+                minutes=minutes,
+                start_time=current_time
+            ))
+            current_time += timedelta(minutes=minutes)
+        
+        if periods:
+            return [SleepDay(
+                date=base_time,
+                sleep_start=periods[0].start_time,
+                sleep_end=periods[-1].start_time + timedelta(minutes=periods[-1].minutes),
+                periods=periods
+            )]
+        return []
         
     finally:
-        # Always clean up notifications
         if notify_char:
             await client.stop_notify(notify_char)
-
-def parse_sleep_data(packet: bytearray) -> list[SleepDay]:
-    """Parse sleep data from the Big Data protocol response"""
-    try:
-        assert len(packet) >= 6, "Packet too short"
-        assert packet[0] == BIG_DATA_MAGIC, "Invalid magic number"
-        assert packet[1] == SLEEP_DATA_ID, "Invalid sleep data ID"
-        
-        num_days = packet[6]
-        logger.debug(f"Number of days in response: {num_days}")
-        
-        sleep_days = []
-        offset = 7
-        
-        for _ in range(num_days):
-            days_ago = packet[offset]
-            num_bytes = packet[offset + 1]
-            sleep_start_minutes = (packet[offset + 2] << 8) | packet[offset + 3]
-            sleep_end_minutes = (packet[offset + 4] << 8) | packet[offset + 5]
-            
-            logger.debug(f"Parsing day {days_ago} days ago, {num_bytes} bytes")
-            
-            # Calculate actual dates
-            base_date = datetime.now(timezone.utc) - timedelta(days=days_ago)
-            base_date = base_date.replace(hour=0, minute=0, second=0, microsecond=0)
-            
-            sleep_start = base_date + timedelta(minutes=sleep_start_minutes)
-            sleep_end = base_date + timedelta(minutes=sleep_end_minutes)
-            
-            # Parse sleep periods
-            periods = []
-            period_offset = offset + 6
-            current_time = sleep_start
-            
-            while period_offset < offset + num_bytes:
-                sleep_type = SleepType(packet[period_offset])
-                minutes = packet[period_offset + 1]
-                
-                periods.append(SleepPeriod(
-                    type=sleep_type,
-                    minutes=minutes,
-                    start_time=current_time
-                ))
-                
-                current_time += timedelta(minutes=minutes)
-                period_offset += 2
-                
-            sleep_days.append(SleepDay(
-                date=base_date,
-                sleep_start=sleep_start,
-                sleep_end=sleep_end,
-                periods=periods
-            ))
-            
-            offset += num_bytes
-            
-        return sleep_days
-    except Exception as e:
-        logger.error(f"Error parsing sleep data: {e}")
-        return []
 
 async def main():
     # Find the ring
