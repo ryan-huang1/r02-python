@@ -17,8 +17,8 @@ The goal here is to replicate all the functions from the QRing app, and integrat
 - [ ] Accelerometer for step tracking
 - [ ] Accelerometer for sleep tracking
 - [ ] Accelerometer for gesture detection
-- [ ] Blood oxygen (SPO2) history
-- [ ] Heart rate logging with periodic measurements
+- [ ] Get Blood oxygen (SPO2) history
+- [ ] Get Heart rate history
 - [ ] "Stress" measurement
 - [ ] Rebooting the device
 - [ ] Retrieving device information (hardware/firmware versions)
