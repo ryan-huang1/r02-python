@@ -20,5 +20,4 @@ The goal here is to replicate all the functions from the QRing app, and integrat
 - [ ] Get Blood oxygen (SPO2) history
 - [ ] Get Heart rate history
 - [ ] "Stress" measurement
-- [ ] Rebooting the device
 - [ ] Retrieving device information (hardware/firmware versions)
