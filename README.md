@@ -14,10 +14,10 @@ The goal here is to replicate all the functions from the QRing app, and integrat
 - [x] Real-time SPO2 data
 - [x] Setting the time on the ring
 - [x] Adjusting the heart rate logging frequency
+- [x] Retrieving device information (hardware/firmware versions)
 - [ ] Accelerometer for step tracking
 - [ ] Accelerometer for sleep tracking
 - [ ] Accelerometer for gesture detection
 - [ ] Get Blood oxygen (SPO2) history
 - [ ] Get Heart rate history
 - [ ] "Stress" measurement
-- [ ] Retrieving device information (hardware/firmware versions)
